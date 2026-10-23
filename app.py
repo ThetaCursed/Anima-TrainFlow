@@ -3,9 +3,11 @@ import re
 import json
 import platform
 import subprocess
+import atexit
 import toml
 import glob
 import math
+from collections import deque
 from pathlib import Path
 import sys
 import gradio as gr
@@ -100,6 +102,14 @@ LOG_BLACKLIST = [
 LOG_BOX__MAX_LINES = 16
 GALLERY_HEIGHT = 440
 MAX_LOG_LINES = 500
+MAX_GALLERY_IMAGES = 24
+STEP_RE = re.compile(r"(\d+)/(\d+)")
+
+# How often the UI generator refreshes its view of the running trainer.
+UI_POLL_SECONDS = 0.5
+# If the trainer prints nothing for this long we say so in the log, so a slow
+# sampling/saving phase is not mistaken for a frozen process.
+STALL_WARN_SECONDS = 90
 
 
 ROOT = Path(__file__).resolve().parent
@@ -111,8 +121,6 @@ SETTINGS_FILE = TRAIN_BASE / "settings.json"
 
 TRAIN_DIR = TRAIN_BASE / "sd-scripts" 
 TRAIN_SCRIPT = TRAIN_DIR / "anima_train_network.py"
-
-training_process = None
 
 for d in [TRAIN_BASE, OUTPUT_BASE]:
     d.mkdir(parents=True, exist_ok=True)
@@ -175,15 +183,17 @@ HIDDEN_SETTINGS = {
     "network_train_unet_only": True,
     "timestep_sampling": "sigmoid",
     "discrete_flow_shift": 1.0,
-    "weighting_scheme": "none",
+    "weighting_scheme": "logit_normal",
     "cache_latents": True,
     "cache_latents_to_disk": True,
     "cache_text_encoder_outputs_to_disk": True,
     "cache_text_encoder_outputs": True,
     "sdpa": True,
-    "weighting_scheme": "logit_normal",
-    # 1 worker on Windows: more workers can hang silently in the DataLoader (spawn) without any error
-    "max_data_loader_n_workers": 1,
+    # 0 workers: sd-scripts then loads batches in the main process. On Windows a
+    # spawn-based DataLoader worker can stall forever inside next(train_dataloader)
+    # with no error and freeze the step counter at a random step. Latents and text
+    # encoder outputs are cached to disk, so a worker buys no measurable speed.
+    "max_data_loader_n_workers": 0,
     "persistent_data_loader_workers": False,
     "max_grad_norm": 1.0,
     "vae_batch_size": 1,
@@ -305,9 +315,6 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
         "mixed_precision": HIDDEN_SETTINGS["mixed_precision"],
         "output_dir": actual_output_dir.resolve().as_posix(),
         "output_name": project_name,
-        "save_every_n_steps": int(save_steps),
-        "sample_every_n_steps": int(sample_steps),
-        "sample_prompts": Path(prompt_path).resolve().as_posix(),
         "sample_sampler": "euler",
         "timestep_sampling": HIDDEN_SETTINGS["timestep_sampling"],
         "discrete_flow_shift": HIDDEN_SETTINGS["discrete_flow_shift"],
@@ -320,11 +327,20 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
         "attn_mode": "sdpa",
         "save_model_as": "safetensors",
         "save_precision": "bf16",
-        "max_data_loader_n_workers": 1,
+        "max_data_loader_n_workers": HIDDEN_SETTINGS["max_data_loader_n_workers"],
         "vae_chunk_size": 32,
         "vae_disable_cache": True,
         "seed": int(train_seed),
     }
+
+    # 0 is NOT a valid value for these: sd-scripts evaluates `global_step % n` and
+    # `steps % n`, so a 0 crashes with ZeroDivisionError at the first step. Only
+    # write the key when the user actually wants periodic previews/checkpoints.
+    if int(sample_steps) > 0:
+        training_config["sample_every_n_steps"] = int(sample_steps)
+    if int(save_steps) > 0:
+        training_config["save_every_n_steps"] = int(save_steps)
+    training_config["sample_prompts"] = Path(prompt_path).resolve().as_posix()
     with open(config_path, "w", encoding="utf-8") as f: toml.dump(training_config, f)
     return str(config_path)
 
@@ -334,7 +350,7 @@ def get_latest_images(sample_dir):
     images = glob.glob(str(sample_dir / "*.png")) + glob.glob(str(sample_dir / "*.jpg")) + glob.glob(str(sample_dir / "*.webp"))
     images.sort(key=os.path.getmtime, reverse=True)
     
-    return [(img, Path(img).name) for img in images]
+    return [(img, Path(img).name) for img in images[:MAX_GALLERY_IMAGES]]
 
 
 # ==========================================
@@ -719,11 +735,250 @@ def open_dataset_folder_ui(dataset_dir, current_logs):
 
 
 # ==========================================
+# TRAINING SESSION (decoupled from the web UI)
+# ==========================================
+# The trainer subprocess is NOT read from inside the Gradio generator anymore.
+#
+# Old behaviour (the freeze the user reported):
+#   the generator did `for line in iter(proc.stdout.readline, "")` and yielded the
+#   whole log on every single line. The generator only advances while the browser
+#   keeps consuming it, so as soon as the tab was hidden/reloaded/slow, or the
+#   Gradio queue pushed back, nothing drained the child's stdout pipe. The pipe
+#   buffer (64 KB on Windows) fills up, the child blocks forever inside write()
+#   and the step counter just stops - no traceback, no error, GPU idle.
+#   On top of that the global `training_process` was set to None on generator
+#   exit, so the zombie became unreachable and the next "Start Training" happily
+#   stacked a second job on the same GPU.
+#
+# New behaviour:
+#   a dedicated daemon thread always drains stdout into a rolling buffer, while
+#   the Gradio generator only *polls* that buffer. Killing the browser tab can no
+#   longer stall training, and reloading the page re-attaches to the live session.
+
+TRAIN_SESSION = None
+
+
+def _kill_process_tree(pid):
+    """Kill a process together with its children (taskkill /T on Windows)."""
+    if not pid:
+        return
+    if platform.system() == "Windows":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+                timeout=20,
+            )
+            return
+        except Exception:
+            pass  # fall through to psutil
+    try:
+        parent = psutil.Process(pid)
+        for child in parent.children(recursive=True):
+            try: child.kill()
+            except psutil.NoSuchProcess: pass
+        try: parent.kill()
+        except psutil.NoSuchProcess: pass
+    except psutil.NoSuchProcess:
+        pass
+
+
+def find_stray_trainers() -> List[psutil.Process]:
+    """Leftover trainer processes (accelerate -> anima_train_network.py).
+
+    A leftover silently keeps VRAM occupied and makes the next run look 2x slower
+    or freeze outright, which is why stale processes have to be cleaned up.
+    """
+    strays = []
+    own_pid = os.getpid()
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if proc.pid == own_pid:
+                continue
+            cmdline = proc.info.get("cmdline") or []
+            joined = " ".join(cmdline)
+            if "anima_train_network.py" in joined or "anima_train.py" in joined:
+                strays.append(proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+    return strays
+
+
+class TrainingSession:
+    """Owns the trainer subprocess and its log buffer, independent of the UI."""
+
+    def __init__(self, sample_dir: Path):
+        self.sample_dir = sample_dir
+        self.process = None
+        self.log_lines = deque(maxlen=MAX_LOG_LINES)
+        self.log_file = None
+        self.stopping = False
+        self.returncode = None
+        self.started_at = time.time()
+        self.last_output_at = time.time()
+        self._lock = threading.Lock()
+        self._reader = None
+
+    # ---------- state ----------
+    def is_alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def log(self, line: str):
+        self._push(line)
+
+    def _push(self, line: str, to_file: bool = True):
+        with self._lock:
+            self.last_output_at = time.time()
+            # drop a trailing "still alive" marker, real output replaced it
+            while self.log_lines and self.log_lines[-1].startswith("⏳"):
+                self.log_lines.pop()
+            # tqdm writes one line per step: keep only the newest one in the box
+            if "steps:" in line and STEP_RE.search(line) and self.log_lines and self.log_lines[-1].startswith("steps:"):
+                self.log_lines[-1] = line
+            else:
+                self.log_lines.append(line)
+            if to_file and self.log_file is not None:
+                try:
+                    self.log_file.write(line + "\n")
+                    self.log_file.flush()
+                except Exception:
+                    pass
+
+    def snapshot(self):
+        """Return (log text, gallery images) for the current state."""
+        now = time.time()
+        silent_for = now - self.last_output_at
+        with self._lock:
+            if self.is_alive() and silent_for > STALL_WARN_SECONDS:
+                msg = (
+                    f"⏳ Trainer is alive, no output for {int(silent_for // 60)} min "
+                    f"(sampling / saving / slow step) - still working"
+                )
+                while self.log_lines and self.log_lines[-1].startswith("⏳"):
+                    self.log_lines.pop()
+                self.log_lines.append(msg)
+            log_text = "\n".join(self.log_lines)
+        return log_text, get_latest_images(self.sample_dir)
+
+    # ---------- lifecycle ----------
+    def start(self, cmd, env, cwd, log_path: Path, first_lines: List[str]):
+        with self._lock:
+            self.log_lines.extend(first_lines)
+        try:
+            self.log_file = open(log_path, "a", encoding="utf-8", errors="ignore")
+            self.log_file.write("\n\n===== run %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+            for ln in first_lines:
+                self.log_file.write(ln + "\n")
+            self.log_file.flush()
+        except Exception:
+            self.log_file = None
+
+        self.process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            universal_newlines=True,
+            bufsize=1,
+            cwd=str(cwd),
+            env=env,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        self.started_at = self.last_output_at = time.time()
+        self._reader = threading.Thread(target=self._read_loop, name="trainer-stdout", daemon=True)
+        self._reader.start()
+
+    def _read_loop(self):
+        """Always drain stdout. Blocks on readline, never on the browser."""
+        proc = self.process
+        try:
+            for raw in iter(proc.stdout.readline, ""):
+                line = raw.replace("\r", "").strip()
+                if not line:
+                    continue
+                if any(skip_word in line for skip_word in LOG_BLACKLIST):
+                    continue
+                self._push(line)
+        except Exception as exc:
+            self._push(f"❌ Log reader error: {exc}")
+        finally:
+            try: proc.stdout.close()
+            except Exception: pass
+            try:
+                self.returncode = proc.wait(timeout=10)
+            except Exception:
+                self.returncode = proc.poll()
+            with self._lock:
+                self.last_output_at = time.time()
+
+    def stop(self) -> str:
+        if self.process is None:
+            return "ℹ️ Not running."
+        if not self.is_alive():
+            self.cleanup_files()
+            return "ℹ️ Process already finished."
+        self.stopping = True
+        self.log("🛑 Stopping training... (clearing VRAM)")
+        _kill_process_tree(self.process.pid)
+        try:
+            self.process.wait(timeout=20)
+        except Exception:
+            pass
+        # make sure nothing survived (accelerate children / dataloader workers)
+        for stray in find_stray_trainers():
+            _kill_process_tree(stray.pid)
+        self.cleanup_files()
+        self.log("🛑 Training stopped. VRAM should be free now.")
+        return "🛑 Training stopped. VRAM should be free now."
+
+    def cleanup_files(self):
+        with self._lock:
+            if self.log_file is not None:
+                try: self.log_file.close()
+                except Exception: pass
+                self.log_file = None
+
+
+@atexit.register
+def _shutdown_training_session():
+    """Never leave an orphaned trainer behind that keeps the GPU busy."""
+    if TRAIN_SESSION is not None and TRAIN_SESSION.is_alive():
+        try:
+            TRAIN_SESSION.stop()
+        except Exception:
+            pass
+
+
+# ==========================================
 # TRAINING FUNCTIONS
 # ==========================================
 
 def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc):
-    global training_process
+    global TRAIN_SESSION
+
+    # Re-attach FIRST: the page may have been reloaded while a run is going on, and
+    # in that case the form values must not be re-validated or re-submitted.
+    if TRAIN_SESSION is not None and TRAIN_SESSION.is_alive():
+        # The page was reloaded / the tab was switched while training kept going.
+        # Re-attach to the live session instead of refusing or, worse, starting a
+        # second job on the same GPU.
+        session = TRAIN_SESSION
+        session.log("🔁 Re-attached to the training that is already running.")
+        last_text, last_key = None, None
+        while session.is_alive():
+            text, images = session.snapshot()
+            key = tuple(name for _, name in images)
+            if text != last_text or key != last_key:
+                last_text, last_key = text, key
+                yield text, (images if key else gr.update())
+            time.sleep(UI_POLL_SECONDS)
+        text, images = session.snapshot()
+        yield text, images
+        return
 
     model_errors = []
     if not dit_p or not os.path.isfile(dit_p): model_errors.append(f"❌ DiT file not found: {dit_p}")
@@ -781,10 +1036,6 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         )
         yield cuda_error, gr.update()
         return
-    
-    if training_process is not None and training_process.poll() is None:
-        yield "⚠️ Training is already running!", gr.update()
-        return
 
     project_name = re.sub(r'[^a-zA-Z0-9]', '_', trigger_word.strip()).strip('_') or "untitled"
 
@@ -796,10 +1047,19 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         d.mkdir(parents=True, exist_ok=True)
 
     log_lines = [f"🚀 Preparing: {project_name}..."]
-    last_image_count = 0
-    step_pattern = re.compile(r"(\d+)/(\d+)") 
-    
+
     yield "\n".join(log_lines), gr.update()
+
+    # A leftover trainer from a killed run keeps VRAM busy and makes the new run
+    # freeze or crawl, so clean the GPU before starting.
+    strays = find_stray_trainers()
+    if strays:
+        pids = ", ".join(str(p.pid) for p in strays)
+        log_lines.append(f"🧹 Killing leftover trainer process(es) from a previous run: {pids}")
+        yield "\n".join(log_lines), gr.update()
+        for stray in strays:
+            _kill_process_tree(stray.pid)
+        time.sleep(3)
 
     log_lines.append(f"🔍 Analyzing dataset images...")
     base_res, max_bucket = analyze_dataset_resolution(dataset_path)
@@ -821,81 +1081,61 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     env["PYTHONPATH"] = str(TRAIN_DIR.resolve()) + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONWARNINGS"] = "ignore"
+    env["PYTHONUNBUFFERED"] = "1"
     env["TORCH_CPP_LOG_LEVEL"] = "ERROR"
     env["KMP_WARNINGS"] = "0"
     env["CUDA_VISIBLE_DEVICES"] = "0"
     env["ACCELERATE_USE_CPU"] = "False"
 
+    session = TrainingSession(sample_dir)
+    TRAIN_SESSION = session
+
+    log_lines.append("⏳ Launching trainer... (full log is also written to train.log in the checkpoint folder)")
+
     try:
-        training_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1, cwd=str(TRAIN_DIR.resolve()), env=env, encoding="utf-8", errors="ignore")
-        
-        for line in iter(training_process.stdout.readline, ""):
-            line_str = line.replace('\r', '').strip()
-            if not line_str: continue
-
-            if any(skip_word in line_str for skip_word in LOG_BLACKLIST): continue 
-
-            if "subprocess.CalledProcessError" in line_str and "returned non-zero exit status 15" in line_str:
-                log_lines.append("🛑 Interrupted by user.")
-                yield "\n".join(log_lines), gr.update()
-                break 
-
-            if "steps:" in line_str and "/" in line_str:
-                match = step_pattern.search(line_str)
-                if match:
-                    current_step_info = match.group(0)
-                    if log_lines and "steps:" in log_lines[-1] and current_step_info in log_lines[-1]:
-                        log_lines[-1] = line_str
-                    else:
-                        log_lines.append(line_str)
-                else:
-                    log_lines.append(line_str)
-            else:
-                log_lines.append(line_str)
-            
-            if len(log_lines) > MAX_LOG_LINES: del log_lines[:-MAX_LOG_LINES]
-
-            check_image = any(x in line_str.lower() for x in ["saved", "sample", "%|", "it/s", "s/it"])
-            if check_image:
-                current_images = get_latest_images(sample_dir)
-                if len(current_images) != last_image_count:
-                    last_image_count = len(current_images)
-                    yield "\n".join(log_lines), current_images
-                    continue
-
-            yield "\n".join(log_lines), gr.update()
-            
-        if training_process is not None:
-            training_process.wait()
-            
-        log_lines.append("✅ Process finished or stopped.")
-        yield "\n".join(log_lines), get_latest_images(sample_dir)
-        
+        session.start(cmd, env, TRAIN_DIR, project_out_dir / "train.log", log_lines)
     except Exception as e:
-        log_lines.append(f"❌ Error: {str(e)}")
-        yield "\n".join(log_lines), gr.update()
-    finally:
-        training_process = None
+        session.log(f"❌ Could not start the trainer: {e}")
+        session.cleanup_files()
+        yield session.snapshot()
+        return
+
+    # Poll the buffer instead of driving the training loop from this request:
+    # the browser can now be closed, hidden or reloaded without stalling training.
+    last_text, last_key = None, None
+    while session.is_alive():
+        text, images = session.snapshot()
+        key = tuple(name for _, name in images)
+        if text != last_text or key != last_key:
+            last_text, last_key = text, key
+            yield text, (images if key else gr.update())
+        time.sleep(UI_POLL_SECONDS)
+
+    session.cleanup_files()
+    returncode = session.process.poll() if session.process is not None else None
+    if session.stopping:
+        pass  # stop() already logged the message
+    elif returncode == 0:
+        session.log("✅ Training finished. LoRA saved to the checkpoint folder.")
+    else:
+        session.log(
+            f"❌ Training process exited with code {returncode}. Check the log above "
+            f"or {project_out_dir / 'train.log'} for details."
+        )
+    text, images = session.snapshot()
+    yield text, images
+
 
 def stop_training():
-    global training_process
-    if training_process is not None:
-        try:
-            parent = psutil.Process(training_process.pid)
-            for child in parent.children(recursive=True):
-                try: child.terminate()
-                except psutil.NoSuchProcess: pass
-            gone, alive = psutil.wait_procs(parent.children(recursive=True), timeout=3)
-            for survival in alive:
-                try: survival.kill()
-                except psutil.NoSuchProcess: pass
-            parent.terminate()
-            parent.wait(timeout=3)
-            return "🛑 Stopping training... (Clearing VRAM)"
-        except psutil.NoSuchProcess:
-            return "ℹ️ Process already finished."
-        except Exception as e:
-            return f"⚠️ Error during stop: {str(e)}"
+    if TRAIN_SESSION is not None and TRAIN_SESSION.is_alive():
+        return TRAIN_SESSION.stop()
+
+    # Nothing tracked, but a zombie from a crashed/reloaded run may still hold VRAM.
+    strays = find_stray_trainers()
+    for stray in strays:
+        _kill_process_tree(stray.pid)
+    if strays:
+        return f"🧹 Killed {len(strays)} leftover trainer process(es). VRAM should be free."
     return "ℹ️ Not running."
 
 def open_output_folder(trigger_word):

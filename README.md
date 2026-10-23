@@ -61,6 +61,24 @@ If you prefer to set up the environment manually instead of using the portable v
 ## Dataset Preparation
 Place all your training images (.png, .jpg, .webp) in a single folder. Every image must have a matching text file with the same name containing its tags/captions (e.g., `image1.png` and `image1.txt`). You can easily generate these text files using the built-in **Auto-Caption Dataset** tool.
 
+## Troubleshooting
+
+**Training stops at a random step / the step counter freezes (no error).**
+The trainer runs as a separate process, and its output is drained by a dedicated
+thread that never depends on the browser. Older builds read that output directly
+inside the Gradio request: if the tab was hidden, reloaded or the UI was slow, the
+pipe buffer filled up and the training process blocked forever inside `write()` —
+the step counter simply stopped with no traceback. If you still see a stall:
+
+* Check `training/output/<project>/train.log` — the full trainer output is always
+  written there, even if the UI is not updating.
+* If the log says `⏳ Trainer is alive, no output for N min`, the GPU is still
+  working (sampling or saving a checkpoint) — it is not frozen.
+* Press **Stop** before starting a new run. Leftover `python.exe`/accelerate
+  processes keep VRAM busy, and the app now kills them automatically before a run.
+* Reloading the page is safe: pressing **Start Training** re-attaches to the run
+  that is already in progress instead of launching a second job.
+
 ## System Requirements
 * **OS:** Windows 10/11.
 * **GPU:** NVIDIA GPU (6GB+ VRAM recommended for Anima 2B training).

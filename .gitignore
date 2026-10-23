@@ -1,0 +1,10 @@
+# Local bug reports / user screenshots - never publish
+/userproblem/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Runtime artifacts produced by the app / trainer
+/training/output/
+/training/settings.json
